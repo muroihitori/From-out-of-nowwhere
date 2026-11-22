@@ -1,0 +1,1557 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="White Screen" />
+  <meta name="theme-color" content="#ffffff" />
+  <title>White Screen / 3-5mm Flies v22 (Lowered Hind Legs)</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+      user-select: none;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #eceef2;
+      touch-action: none;
+    }
+    /* 画面全体への光学拡散ブラー（すりガラス・逆光プレビューモニター質感） */
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background-color: #ffffff;
+      filter: blur(1.2px) contrast(1.04);
+      transform: scale(1.016);
+      transform-origin: center center;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <script>
+    'use strict';
+
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { alpha: false });
+
+    let width = window.innerWidth;
+    let height = window.innerHeight;
+    let dpr = Math.min(window.devicePixelRatio || 1, 3);
+
+    function resize() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      dpr = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // =========================================================================
+    // 0. 展示用スリープ防止（Screen Wake Lock API）
+    // =========================================================================
+    let wakeLock = null;
+    async function requestWakeLock() {
+      try {
+        if ('wakeLock' in navigator && !wakeLock) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          wakeLock.addEventListener('release', () => {
+            wakeLock = null;
+          });
+        }
+      } catch (_) {}
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        requestWakeLock();
+        if (SoundEngine.ctx && SoundEngine.ctx.state === 'suspended') {
+          SoundEngine.ctx.resume();
+        }
+      }
+    });
+
+    // =========================================================================
+    // 1. 個体サイズ連動・立体羽音合成エンジン（3〜5mmの体格差によるピッチ変化）
+    // =========================================================================
+    const MAX_FLIES = 6;
+    const AUDIO_VOICES = 4;
+
+    const SoundEngine = {
+      ctx: null,
+      masterGain: null,
+      airFilter: null,
+      formantFilter: null,
+      noiseSource: null,
+      noiseGain: null,
+      voices: [],
+      initialized: false,
+
+      init() {
+        if (this.initialized) {
+          if (this.ctx && this.ctx.state === 'suspended') {
+            this.ctx.resume();
+          }
+          return;
+        }
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        const c = new AC();
+        this.ctx = c;
+
+        const bufSize = c.sampleRate * 2;
+        const noiseBuf = c.createBuffer(1, bufSize, c.sampleRate);
+        const data = noiseBuf.getChannelData(0);
+        for (let i = 0; i < bufSize; i++) {
+          data[i] = Math.random() * 2 - 1;
+        }
+        this.noiseSource = c.createBufferSource();
+        this.noiseSource.buffer = noiseBuf;
+        this.noiseSource.loop = true;
+
+        const noiseFilter = c.createBiquadFilter();
+        noiseFilter.type = 'bandpass';
+        noiseFilter.frequency.value = 940;
+        noiseFilter.Q.value = 2.1;
+
+        this.noiseGain = c.createGain();
+        this.noiseGain.gain.value = 0;
+        this.noiseSource.connect(noiseFilter);
+        noiseFilter.connect(this.noiseGain);
+
+        this.formantFilter = c.createBiquadFilter();
+        this.formantFilter.type = 'peaking';
+        this.formantFilter.frequency.value = 570;
+        this.formantFilter.Q.value = 4.0;
+        this.formantFilter.gain.value = 10.5;
+
+        this.airFilter = c.createBiquadFilter();
+        this.airFilter.type = 'lowpass';
+        this.airFilter.frequency.value = 1380;
+        this.airFilter.Q.value = 1.0;
+
+        this.masterGain = c.createGain();
+        this.masterGain.gain.value = 0.85;
+
+        this.noiseGain.connect(this.formantFilter);
+        this.formantFilter.connect(this.airFilter);
+        this.airFilter.connect(this.masterGain);
+        this.masterGain.connect(c.destination);
+
+        const pitchOffsets = [0, 8, -5, 13];
+        for (let idx = 0; idx < AUDIO_VOICES; idx++) {
+          const basePitch = 188 + pitchOffsets[idx];
+          const oscFund = c.createOscillator();
+          oscFund.type = 'sawtooth';
+          oscFund.frequency.value = basePitch;
+
+          const oscHarm2 = c.createOscillator();
+          oscHarm2.type = 'triangle';
+          oscHarm2.frequency.value = basePitch * 2;
+
+          const oscHarm3 = c.createOscillator();
+          oscHarm3.type = 'sawtooth';
+          oscHarm3.frequency.value = basePitch * 3;
+
+          const lfoJitter = c.createOscillator();
+          lfoJitter.type = 'sine';
+          lfoJitter.frequency.value = 29 + idx * 4;
+          const lfoGain = c.createGain();
+          lfoGain.gain.value = 5.4;
+          lfoJitter.connect(lfoGain);
+          lfoGain.connect(oscFund.frequency);
+          lfoGain.connect(oscHarm2.frequency);
+
+          const harm2Gain = c.createGain();
+          harm2Gain.gain.value = 0.42;
+          const harm3Gain = c.createGain();
+          harm3Gain.gain.value = 0.18;
+
+          const voiceFormant = c.createBiquadFilter();
+          voiceFormant.type = 'peaking';
+          voiceFormant.frequency.value = 550 + idx * 25;
+          voiceFormant.Q.value = 4.2;
+          voiceFormant.gain.value = 10.5;
+
+          const voiceAir = c.createBiquadFilter();
+          voiceAir.type = 'lowpass';
+          voiceAir.frequency.value = 1380;
+
+          const buzzGain = c.createGain();
+          buzzGain.gain.value = 0;
+
+          const oscSub = c.createOscillator();
+          oscSub.type = 'sine';
+          oscSub.frequency.value = 60 + idx * 3;
+          const subGain = c.createGain();
+          subGain.gain.value = 0;
+          oscSub.connect(subGain);
+
+          const panner = c.createStereoPanner ? c.createStereoPanner() : null;
+
+          oscFund.connect(voiceFormant);
+          oscHarm2.connect(harm2Gain);
+          harm2Gain.connect(voiceFormant);
+          oscHarm3.connect(harm3Gain);
+          harm3Gain.connect(voiceFormant);
+
+          voiceFormant.connect(voiceAir);
+          voiceAir.connect(buzzGain);
+
+          if (panner) {
+            buzzGain.connect(panner);
+            subGain.connect(panner);
+            panner.connect(this.masterGain);
+          } else {
+            buzzGain.connect(this.masterGain);
+            subGain.connect(this.masterGain);
+          }
+
+          oscFund.start();
+          oscHarm2.start();
+          oscHarm3.start();
+          oscSub.start();
+          lfoJitter.start();
+
+          this.voices.push({
+            basePitch,
+            oscFund,
+            oscHarm2,
+            oscHarm3,
+            oscSub,
+            voiceAir,
+            buzzGain,
+            subGain,
+            panner
+          });
+        }
+
+        this.noiseSource.start();
+        this.initialized = true;
+      },
+
+      triggerTakeoffBurst(fly) {
+        const v = this.voices[fly.index % AUDIO_VOICES];
+        if (!this.initialized || !v) return;
+        const now = this.ctx.currentTime;
+        const individualPitch = fly.individualPitch || v.basePitch;
+        v.buzzGain.gain.cancelScheduledValues(now);
+        v.buzzGain.gain.setValueAtTime(0.01, now);
+        v.buzzGain.gain.linearRampToValueAtTime(0.36, now + 0.025);
+        v.oscFund.frequency.setValueAtTime(individualPitch + 42, now);
+        v.oscFund.frequency.exponentialRampToValueAtTime(individualPitch + 4, now + 0.14);
+      },
+
+      updateAll(flies, width, height, nowMs) {
+        if (!this.initialized) return;
+        if (this.ctx.state === 'suspended') this.ctx.resume();
+
+        const now = this.ctx.currentTime;
+        let maxAirborneProx = 0;
+
+        const airborneFlies = flies.filter(
+          f => f.state === 'flying' || f.state === 'landing_approach' || f.state === 'leaving'
+        );
+
+        for (let vi = 0; vi < AUDIO_VOICES; vi++) {
+          const v = this.voices[vi];
+          const fly = airborneFlies[vi];
+
+          if (fly) {
+            if (v.panner) {
+              const pan = Math.max(-0.85, Math.min(0.85, (fly.x / width) * 2 - 1));
+              v.panner.pan.setTargetAtTime(pan, now, 0.04);
+            }
+
+            const zProximity = 0.85 + Math.max(0, fly.z) * 0.35;
+            const dx = (fly.x - width * 0.5) / (width * 0.5);
+            const dy = (fly.y - height * 0.5) / (height * 0.5);
+            const dist = Math.min(1.45, Math.hypot(dx, dy));
+            const prox = Math.max(0.12, (1.15 - dist * 0.72) * zProximity);
+            maxAirborneProx = Math.max(maxAirborneProx, prox);
+
+            const speedNorm = Math.min(1.5, fly.speed / 6.5);
+            const accelBoost = Math.max(-18, Math.min(28, (fly.speed - fly.prevSpeed) * 18));
+            const baseP = fly.individualPitch || v.basePitch;
+            const freq = baseP + speedNorm * 26 + accelBoost + Math.sin(nowMs * 0.024 + vi * 2.1) * 4.5;
+
+            v.oscFund.frequency.setTargetAtTime(freq, now, 0.02);
+            v.oscHarm2.frequency.setTargetAtTime(freq * 2.0, now, 0.02);
+            v.oscHarm3.frequency.setTargetAtTime(freq * 3.01, now, 0.02);
+            v.oscSub.frequency.setTargetAtTime(58 + speedNorm * 11, now, 0.03);
+            v.voiceAir.frequency.setTargetAtTime(520 + prox * 1500, now, 0.04);
+
+            const polyScale = airborneFlies.length > 1 ? 0.72 : 1.0;
+            const targetBuzz = 0.24 * polyScale * prox * Math.max(0.32, speedNorm);
+            const targetSub = 0.18 * polyScale * prox * Math.max(0.3, speedNorm);
+            v.buzzGain.gain.setTargetAtTime(targetBuzz, now, 0.025);
+            v.subGain.gain.setTargetAtTime(targetSub, now, 0.03);
+          } else {
+            v.buzzGain.gain.setTargetAtTime(0, now, 0.015);
+            v.subGain.gain.setTargetAtTime(0, now, 0.018);
+          }
+        }
+
+        this.noiseGain.gain.setTargetAtTime(maxAirborneProx > 0 ? 0.030 * maxAirborneProx : 0, now, 0.03);
+      }
+    };
+
+    // =========================================================================
+    // 2. 個体差のある 3.0mm〜5.0mm 骨格＆羽サイズ・短くコンパクトな8本脚IK設定
+    // =========================================================================
+    const PX_PER_MM = 6.28;
+    const REF_BODY_MM = 4.0;
+    const REF_SCALE = (REF_BODY_MM * PX_PER_MM) / 25.0;
+
+    function mmToBaseScale(mm) {
+      return (mm * PX_PER_MM) / 25.0;
+    }
+
+    // 全体的に一回り短くコンパクトにした前寄り・左右対称8本脚（前脚だけさらに短く前へ配置）
+    const LEG_SPECS = [
+      // 第1対（前脚：さらに短くして前へずらす）
+      { id: 'L0', side: -1, idx: 0, group: 0, hipLocal: { x: -2.8, y: -6.1 }, restLocal: { x: -5.2,  y: -16.8 }, femurLen: 5.0,  tibiaLen: 5.7 },
+      { id: 'R0', side:  1, idx: 0, group: 1, hipLocal: { x:  2.8, y: -6.1 }, restLocal: { x:  5.2,  y: -16.8 }, femurLen: 5.0,  tibiaLen: 5.7 },
+      // 第2対（前中脚）
+      { id: 'L1', side: -1, idx: 1, group: 1, hipLocal: { x: -4.4, y: -2.5 }, restLocal: { x: -14.4, y:  -4.9 }, femurLen: 7.1,  tibiaLen: 7.9 },
+      { id: 'R1', side:  1, idx: 1, group: 0, hipLocal: { x:  4.4, y: -2.5 }, restLocal: { x:  14.4, y:  -4.9 }, femurLen: 7.1,  tibiaLen: 7.9 },
+      // 第3対（後中脚）
+      { id: 'L3', side: -1, idx: 3, group: 0, hipLocal: { x: -4.4, y: -0.3 }, restLocal: { x: -14.1, y:   2.8 }, femurLen: 7.3,  tibiaLen: 8.2 },
+      { id: 'R3', side:  1, idx: 3, group: 1, hipLocal: { x:  4.4, y: -0.3 }, restLocal: { x:  14.1, y:   2.8 }, femurLen: 7.3,  tibiaLen: 8.2 },
+      // 第4対（後脚：もう少し後方・下側へ下げる）
+      { id: 'L2', side: -1, idx: 2, group: 1, hipLocal: { x: -3.2, y:  2.4 }, restLocal: { x: -9.2,  y:  14.8 }, femurLen: 8.1,  tibiaLen: 9.2 },
+      { id: 'R2', side:  1, idx: 2, group: 0, hipLocal: { x:  3.2, y:  2.4 }, restLocal: { x:  9.2,  y:  14.8 }, femurLen: 8.1,  tibiaLen: 9.2 }
+    ];
+
+    function localToWorld(lx, ly, flyX, flyY, bodyAngle, scale) {
+      const rot = bodyAngle + Math.PI / 2;
+      const cos = Math.cos(rot);
+      const sin = Math.sin(rot);
+      return {
+        x: flyX + (lx * cos - ly * sin) * scale,
+        y: flyY + (lx * sin + ly * cos) * scale
+      };
+    }
+
+    function clampFootToAnatomicalReach(footX, footY, hipX, hipY, spec, scale) {
+      const maxReach = (spec.femurLen + spec.tibiaLen) * 0.86 * scale;
+      const minReach = Math.abs(spec.femurLen - spec.tibiaLen) * scale + 1.1 * scale;
+      const dx = footX - hipX;
+      const dy = footY - hipY;
+      const dist = Math.hypot(dx, dy);
+      if (dist > maxReach && dist > 0.0001) {
+        return {
+          x: hipX + (dx / dist) * maxReach,
+          y: hipY + (dy / dist) * maxReach
+        };
+      }
+      if (dist < minReach && dist > 0.0001) {
+        return {
+          x: hipX + (dx / dist) * minReach,
+          y: hipY + (dy / dist) * minReach
+        };
+      }
+      return { x: footX, y: footY };
+    }
+
+    function randomizeFlyMorphology(fly) {
+      const bodyMm = 3.0 + Math.random() * 2.0;
+      fly.bodyMm = bodyMm;
+      fly.scale = mmToBaseScale(bodyMm);
+
+      // 個体ごとの羽の長さ・幅のバリエーション
+      fly.wingLenScale = 0.86 + Math.random() * 0.30;
+      fly.wingWidthScale = 0.88 + Math.random() * 0.26;
+
+      // 体の大きさに反比例する羽音の基本周波数（5mmは約174Hz、3mmは約208Hz）
+      const sizeNorm = (bodyMm - 3.0) / 2.0;
+      fly.individualPitch = 208 - sizeNorm * 34 + (Math.random() - 0.5) * 6;
+    }
+
+    function createFlyEntity(index) {
+      const legs = LEG_SPECS.map(spec => ({
+        spec,
+        worldFootX: 0,
+        worldFootY: 0,
+        prevFootX: 0,
+        prevFootY: 0,
+        stepStartX: 0,
+        stepStartY: 0,
+        stepTargetX: 0,
+        stepTargetY: 0,
+        isStepping: false,
+        stepProgress: 0,
+        liftHeight: 0
+      }));
+
+      const fly = {
+        index,
+        bodyMm: 4.0,
+        scale: REF_SCALE,
+        wingLenScale: 1.0,
+        wingWidthScale: 1.0,
+        individualPitch: 190,
+        x: -60,
+        y: -60,
+        z: 0.5,
+        targetZ: 0.5,
+        prevX: -60,
+        prevY: -60,
+        frameStartX: -60,
+        frameStartY: -60,
+        vx: 0,
+        vy: 0,
+        speed: 0,
+        prevSpeed: 0,
+        targetSpeed: 0,
+        angle: 0,
+        prevAngle: 0,
+        frameStartAngle: 0,
+        angularVel: 0,
+        targetAngle: 0,
+        state: 'waiting',
+        stateTimer: 0,
+        totalActiveTime: 0,
+        maxStayTime: 50000,
+        wingPhase: index * 1.3,
+        wingSpreadBias: (Math.random() - 0.5) * 0.06,
+        groomPhase: 0,
+        groomType: 'front',
+        activeTripodGroup: index % 2,
+        nextSpawnTime: Infinity,
+        orbitDir: index % 2 === 0 ? 1 : -1,
+        legs
+      };
+      randomizeFlyMorphology(fly);
+      return fly;
+    }
+
+    function getDepthPerspectiveScale(z) {
+      return Math.max(0.75, 1.0 + z * 0.34);
+    }
+
+    function snapAllFeetToRest(fly) {
+      const effectiveScale = fly.scale * getDepthPerspectiveScale(fly.z);
+      for (const leg of fly.legs) {
+        const w = localToWorld(leg.spec.restLocal.x, leg.spec.restLocal.y, fly.x, fly.y, fly.angle, effectiveScale);
+        leg.worldFootX = w.x;
+        leg.worldFootY = w.y;
+        leg.prevFootX = w.x;
+        leg.prevFootY = w.y;
+        leg.isStepping = false;
+        leg.stepProgress = 0;
+        leg.liftHeight = 0;
+      }
+    }
+
+    // =========================================================================
+    // 3. 光源（逆光の光漏れスポット）＆ 1匹ソロ出現＋群れ出現インターバル制御
+    // =========================================================================
+    const flies = Array.from({ length: MAX_FLIES }, (_, i) => createFlyEntity(i));
+
+    const LightSource = {
+      baseX: width * 0.46,
+      baseY: height * 0.42,
+      x: width * 0.46,
+      y: height * 0.42,
+      isGatheringMoment: false,
+      gatheringEndTime: 0,
+
+      update(now) {
+        const t = now * 0.00035;
+        this.baseX = width * 0.46;
+        this.baseY = height * 0.42;
+        this.x = this.baseX + Math.sin(t) * (width * 0.06);
+        this.y = this.baseY + Math.cos(t * 0.8) * (height * 0.05);
+
+        if (this.isGatheringMoment && now > this.gatheringEndTime) {
+          this.isGatheringMoment = false;
+        }
+      }
+    };
+
+    let nextWaveTime = performance.now() + 800;
+    let waveCount = 0;
+    let currentWaveIsSolo = false;
+
+    function triggerWave(baseTime) {
+      waveCount++;
+      const isSoloInterval = (waveCount % 2 === 0);
+      currentWaveIsSolo = isSoloInterval;
+
+      if (isSoloInterval) {
+        LightSource.isGatheringMoment = false;
+        LightSource.gatheringEndTime = 0;
+        flies[0].nextSpawnTime = baseTime;
+        for (let i = 1; i < MAX_FLIES; i++) {
+          flies[i].nextSpawnTime = Infinity;
+        }
+      } else {
+        const swarmSize = 3 + Math.floor(Math.random() * 4);
+        LightSource.isGatheringMoment = true;
+        LightSource.gatheringEndTime = baseTime + 32000 + Math.random() * 18000;
+
+        for (let i = 0; i < MAX_FLIES; i++) {
+          if (i < swarmSize) {
+            flies[i].nextSpawnTime = baseTime + i * (1400 + Math.random() * 2400);
+          } else {
+            flies[i].nextSpawnTime = Infinity;
+          }
+        }
+      }
+    }
+
+    function scheduleNextWave(now) {
+      const allWaiting = flies.every(f => f.state === 'waiting' && f.nextSpawnTime === Infinity);
+      if (allWaiting && nextWaveTime <= now) {
+        const nextIsSolo = ((waveCount + 1) % 2 === 0);
+        const offScreenWaitMs = nextIsSolo
+          ? (18 + Math.random() * 12) * 1000
+          : (28 + Math.random() * 14) * 1000;
+        nextWaveTime = now + offScreenWaitMs;
+        triggerWave(nextWaveTime);
+      }
+    }
+
+    triggerWave(nextWaveTime);
+
+    function spawnSingleFly(fly) {
+      randomizeFlyMorphology(fly);
+
+      const edge = Math.floor(Math.random() * 4);
+      const margin = 42;
+      if (edge === 0) { fly.x = Math.random() * width; fly.y = -margin; }
+      if (edge === 1) { fly.x = width + margin; fly.y = Math.random() * height; }
+      if (edge === 2) { fly.x = Math.random() * width; fly.y = height + margin; }
+      if (edge === 3) { fly.x = -margin; fly.y = Math.random() * height; }
+
+      fly.prevX = fly.x;
+      fly.prevY = fly.y;
+      fly.frameStartX = fly.x;
+      fly.frameStartY = fly.y;
+      fly.vx = 0;
+      fly.vy = 0;
+
+      const aimX = LightSource.x + (Math.random() - 0.5) * (width * 0.34);
+      const aimY = LightSource.y + (Math.random() - 0.5) * (height * 0.34);
+      fly.angle = Math.atan2(aimY - fly.y, aimX - fly.x);
+      fly.prevAngle = fly.angle;
+      fly.frameStartAngle = fly.angle;
+      fly.angularVel = 0;
+      fly.targetAngle = fly.angle;
+      fly.speed = 5.4 + Math.random() * 2.6;
+      fly.prevSpeed = fly.speed;
+      fly.targetSpeed = fly.speed;
+
+      fly.z = 0.35 + Math.random() * 0.60;
+      fly.targetZ = fly.z;
+
+      fly.state = 'flying';
+      fly.stateTimer = 26 + Math.random() * 38;
+      fly.totalActiveTime = 0;
+      fly.wingSpreadBias = (Math.random() - 0.5) * 0.08;
+      fly.orbitDir = Math.random() < 0.5 ? 1 : -1;
+
+      if (currentWaveIsSolo) {
+        fly.maxStayTime = 36000 + Math.random() * 18000;
+      } else {
+        fly.maxStayTime = fly.index === 0
+          ? (45000 + Math.random() * 25000)
+          : (24000 + Math.random() * 20000);
+      }
+
+      fly.nextSpawnTime = Infinity;
+      snapAllFeetToRest(fly);
+    }
+
+    window.addEventListener('pointerdown', (e) => {
+      SoundEngine.init();
+      requestWakeLock();
+      for (const fly of flies) {
+        if (fly.state !== 'waiting') {
+          const dx = fly.x - e.clientX;
+          const dy = fly.y - e.clientY;
+          const dist = Math.hypot(dx, dy);
+          if (dist < 135) {
+            if (fly.totalActiveTime < fly.maxStayTime * 0.78 && Math.random() < 0.72) {
+              fly.state = 'flying';
+              fly.targetAngle = Math.atan2(dy, dx) + (Math.random() - 0.5) * 0.8;
+              fly.targetZ = 0.4 + Math.random() * 0.55;
+              fly.speed = 6.2;
+              fly.targetSpeed = 7.6;
+              fly.stateTimer = 22 + Math.floor(Math.random() * 28);
+              SoundEngine.triggerTakeoffBurst(fly);
+            } else {
+              fly.targetAngle = Math.atan2(dy, dx) + (Math.random() - 0.5) * 0.45;
+              fly.targetZ = 0.85;
+              fly.state = 'leaving';
+              fly.targetSpeed = 8.8;
+              SoundEngine.triggerTakeoffBurst(fly);
+            }
+          }
+        }
+      }
+    }, { passive: true });
+
+    function normalizeAngle(a) {
+      while (a > Math.PI) a -= Math.PI * 2;
+      while (a < -Math.PI) a += Math.PI * 2;
+      return a;
+    }
+
+    function updateLegsIK(fly, isGrounded, isGrooming) {
+      const currentScale = fly.scale * getDepthPerspectiveScale(fly.z);
+
+      for (const leg of fly.legs) {
+        leg.prevFootX = leg.worldFootX;
+        leg.prevFootY = leg.worldFootY;
+      }
+
+      if (!isGrounded) {
+        const heightNorm = Math.max(0, Math.min(1, fly.z));
+        const spread = 0.72 + (1.0 - heightNorm) * 0.28;
+        for (const leg of fly.legs) {
+          const w = localToWorld(
+            leg.spec.restLocal.x * spread,
+            leg.spec.restLocal.y * spread + heightNorm * 1.4,
+            fly.x, fly.y, fly.angle, currentScale
+          );
+          leg.worldFootX = w.x;
+          leg.worldFootY = w.y;
+          leg.isStepping = false;
+          leg.liftHeight = 0;
+        }
+        return;
+      }
+
+      let anySteppingInGroup = [false, false];
+      for (const leg of fly.legs) {
+        if (leg.isStepping) {
+          const stepRate = Math.max(0.32, Math.min(0.52, 0.30 + fly.speed * 0.14));
+          leg.stepProgress += stepRate;
+
+          const liveTarget = localToWorld(
+            leg.spec.restLocal.x,
+            leg.spec.restLocal.y - Math.min(1.9, fly.speed * 0.95),
+            fly.x, fly.y, fly.angle, currentScale
+          );
+
+          if (leg.stepProgress >= 1.0) {
+            leg.stepProgress = 0;
+            leg.isStepping = false;
+            leg.worldFootX = liveTarget.x;
+            leg.worldFootY = liveTarget.y;
+            leg.liftHeight = 0;
+          } else {
+            const t = leg.stepProgress;
+            const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+            leg.worldFootX = leg.stepStartX + (liveTarget.x - leg.stepStartX) * ease;
+            leg.worldFootY = leg.stepStartY + (liveTarget.y - leg.stepStartY) * ease;
+            leg.liftHeight = Math.sin(t * Math.PI) * 1.1;
+            anySteppingInGroup[leg.spec.group] = true;
+          }
+        }
+      }
+
+      if (!anySteppingInGroup[fly.activeTripodGroup]) {
+        fly.activeTripodGroup = 1 - fly.activeTripodGroup;
+      }
+
+      const leadAhead = Math.min(1.9, fly.speed * 0.95);
+      for (const leg of fly.legs) {
+        if (isGrooming) {
+          if (fly.groomType === 'front' && leg.spec.idx === 0) continue;
+          if (fly.groomType === 'hind' && leg.spec.idx === 2) continue;
+        }
+
+        const hipWorld = localToWorld(leg.spec.hipLocal.x, leg.spec.hipLocal.y, fly.x, fly.y, fly.angle, currentScale);
+        const ideal = localToWorld(
+          leg.spec.restLocal.x,
+          leg.spec.restLocal.y - leadAhead,
+          fly.x, fly.y, fly.angle, currentScale
+        );
+        const err = Math.hypot(ideal.x - leg.worldFootX, ideal.y - leg.worldFootY);
+        const maxReach = (leg.spec.femurLen + leg.spec.tibiaLen) * 0.86 * currentScale;
+        const hipDist = Math.hypot(leg.worldFootX - hipWorld.x, leg.worldFootY - hipWorld.y);
+
+        const emergencyStretch = hipDist > maxReach * 0.90;
+        const threshold = (fly.state === 'walking' ? 1.5 : 1.9) * (currentScale / REF_SCALE);
+
+        if (!leg.isStepping && ((err > threshold && leg.spec.group === fly.activeTripodGroup) || emergencyStretch)) {
+          leg.isStepping = true;
+          leg.stepProgress = 0;
+          leg.stepStartX = leg.worldFootX;
+          leg.stepStartY = leg.worldFootY;
+          leg.stepTargetX = ideal.x;
+          leg.stepTargetY = ideal.y;
+        }
+
+        const clamped = clampFootToAnatomicalReach(leg.worldFootX, leg.worldFootY, hipWorld.x, hipWorld.y, leg.spec, currentScale);
+        leg.worldFootX = clamped.x;
+        leg.worldFootY = clamped.y;
+      }
+    }
+
+    function updateSingleFlyStep(fly, now, dt) {
+      fly.prevSpeed = fly.speed;
+      fly.prevX = fly.x;
+      fly.prevY = fly.y;
+      fly.prevAngle = fly.angle;
+
+      if (fly.state === 'waiting') {
+        if (now >= fly.nextSpawnTime) {
+          spawnSingleFly(fly);
+        }
+        return;
+      }
+
+      fly.stateTimer--;
+      fly.totalActiveTime += dt;
+
+      if (fly.totalActiveTime > fly.maxStayTime && fly.state !== 'leaving') {
+        fly.state = 'leaving';
+        fly.targetAngle = Math.atan2(fly.y - height * 0.5, fly.x - width * 0.5) + (Math.random() - 0.5) * 0.5;
+        fly.targetZ = 0.8 + Math.random() * 0.3;
+        fly.targetSpeed = 8.2;
+        SoundEngine.triggerTakeoffBurst(fly);
+      }
+
+      for (const other of flies) {
+        if (other !== fly && other.state !== 'waiting') {
+          const distOther = Math.hypot(fly.x - other.x, fly.y - other.y);
+          const distZ = Math.abs(fly.z - other.z);
+          if (distOther < 24 && distZ < 0.25 && (fly.state === 'stopped' || fly.state === 'grooming') && Math.random() < 0.09) {
+            fly.state = 'flying';
+            fly.targetAngle = Math.atan2(fly.y - other.y, fly.x - other.x) + (Math.random() - 0.5) * 0.9;
+            fly.targetZ = 0.25 + Math.random() * 0.65;
+            fly.speed = 4.2;
+            fly.targetSpeed = 6.6;
+            fly.stateTimer = 20 + Math.floor(Math.random() * 32);
+            SoundEngine.triggerTakeoffBurst(fly);
+            break;
+          }
+        }
+      }
+
+      if (fly.state === 'flying') {
+        if (Math.random() < 0.08) {
+          fly.targetZ = 0.15 + Math.random() * 0.88;
+        }
+        fly.z += (fly.targetZ - fly.z) * 0.10;
+        fly.wingPhase += 2.4;
+
+        const toLightX = LightSource.x - fly.x;
+        const toLightY = LightSource.y - fly.y;
+        const distLight = Math.hypot(toLightX, toLightY);
+        const lightAngle = Math.atan2(toLightY, toLightX);
+
+        if (LightSource.isGatheringMoment) {
+          if (Math.random() < 0.14) {
+            const orbitOffset = fly.orbitDir * (distLight < 95 ? 1.35 : 0.65);
+            fly.targetAngle = lightAngle + orbitOffset + (Math.random() - 0.5) * 0.85;
+            fly.targetSpeed = 3.4 + Math.random() * 5.2;
+          }
+        } else if (Math.random() < 0.095) {
+          fly.targetAngle = fly.angle + (Math.random() - 0.5) * 2.4;
+          fly.targetSpeed = 3.0 + Math.random() * 5.8;
+        }
+
+        if (fly.x < 38 || fly.x > width - 38 || fly.y < 38 || fly.y > height - 38) {
+          fly.targetAngle = Math.atan2(LightSource.y - fly.y, LightSource.x - fly.x);
+          fly.targetSpeed = 5.4;
+        }
+
+        fly.angle += normalizeAngle(fly.targetAngle - fly.angle) * 0.24;
+        fly.speed += (fly.targetSpeed - fly.speed) * 0.20;
+
+        const persp = getDepthPerspectiveScale(fly.z);
+        fly.x += Math.cos(fly.angle) * fly.speed * persp;
+        fly.y += Math.sin(fly.angle) * fly.speed * persp;
+        updateLegsIK(fly, false, false);
+
+        const nearLightBonus = distLight < Math.min(width, height) * 0.34 ? 0.65 : 0.35;
+        if (
+          fly.stateTimer <= 0 &&
+          fly.x > 48 && fly.x < width - 48 &&
+          fly.y > 48 && fly.y < height - 48 &&
+          Math.random() < nearLightBonus
+        ) {
+          fly.state = 'landing_approach';
+          fly.targetZ = 0.0;
+          fly.stateTimer = 11 + Math.floor(Math.random() * 9);
+          fly.targetSpeed = 0.7;
+        } else if (fly.stateTimer <= 0) {
+          fly.stateTimer = 16 + Math.floor(Math.random() * 22);
+        }
+      } else if (fly.state === 'landing_approach') {
+        fly.z += (0.0 - fly.z) * 0.28;
+        fly.wingPhase += 1.9;
+        fly.speed += (0.22 - fly.speed) * 0.26;
+        fly.angle += normalizeAngle(fly.targetAngle - fly.angle) * 0.20;
+
+        fly.x += Math.cos(fly.angle) * fly.speed;
+        fly.y += Math.sin(fly.angle) * fly.speed;
+        updateLegsIK(fly, false, false);
+
+        if (fly.stateTimer <= 0) {
+          fly.z = 0.0;
+          fly.speed = 0;
+          snapAllFeetToRest(fly);
+          fly.state = 'stopped';
+          fly.stateTimer = 30 + Math.floor(Math.random() * 72);
+        }
+      } else if (fly.state === 'stopped') {
+        fly.z = 0.0;
+        fly.speed = 0;
+        fly.wingPhase = 0;
+
+        if (Math.random() < 0.045) {
+          fly.targetAngle = fly.angle + (Math.random() - 0.5) * 1.9;
+        }
+        fly.angle += normalizeAngle(fly.targetAngle - fly.angle) * 0.34;
+        updateLegsIK(fly, true, false);
+
+        if (fly.stateTimer <= 0) {
+          const r = Math.random();
+          const flyChance = LightSource.isGatheringMoment ? 0.34 : 0.16;
+          if (r < 0.52) {
+            fly.state = 'walking';
+            fly.stateTimer = 24 + Math.floor(Math.random() * 48);
+            const toLight = Math.atan2(LightSource.y - fly.y, LightSource.x - fly.x);
+            fly.targetAngle = LightSource.isGatheringMoment
+              ? (toLight + (Math.random() - 0.5) * 1.4)
+              : (fly.angle + (Math.random() - 0.5) * 1.6);
+            fly.targetSpeed = 0.85 + Math.random() * 1.45;
+          } else if (r < 1.0 - flyChance) {
+            fly.state = 'grooming';
+            fly.groomType = Math.random() < 0.65 ? 'front' : 'hind';
+            fly.stateTimer = 32 + Math.floor(Math.random() * 58);
+          } else {
+            fly.state = 'flying';
+            fly.targetAngle = Math.random() * Math.PI * 2;
+            fly.targetZ = 0.30 + Math.random() * 0.65;
+            fly.speed = 4.4;
+            fly.targetSpeed = 6.8;
+            fly.stateTimer = 22 + Math.floor(Math.random() * 38);
+            SoundEngine.triggerTakeoffBurst(fly);
+          }
+        }
+      } else if (fly.state === 'walking') {
+        fly.z = 0.0;
+        fly.wingPhase = 0;
+
+        if (Math.random() < 0.13) {
+          fly.targetAngle = fly.angle + (Math.random() - 0.5) * 1.8;
+          fly.targetSpeed = Math.random() < 0.32 ? 0.14 : (0.95 + Math.random() * 1.65);
+        }
+
+        if (fly.x < 36 || fly.x > width - 36 || fly.y < 36 || fly.y > height - 36) {
+          fly.targetAngle = Math.atan2(LightSource.y - fly.y, LightSource.x - fly.x);
+          fly.targetSpeed = 1.3;
+        }
+
+        fly.angle += normalizeAngle(fly.targetAngle - fly.angle) * 0.32;
+        fly.speed += (fly.targetSpeed - fly.speed) * 0.30;
+
+        fly.x += Math.cos(fly.angle) * fly.speed;
+        fly.y += Math.sin(fly.angle) * fly.speed;
+        updateLegsIK(fly, true, false);
+
+        if (fly.stateTimer <= 0) {
+          fly.state = 'stopped';
+          fly.stateTimer = 28 + Math.floor(Math.random() * 76);
+        }
+      } else if (fly.state === 'grooming') {
+        fly.z = 0.0;
+        fly.speed = 0;
+        fly.groomPhase += 0.62;
+        updateLegsIK(fly, true, true);
+
+        if (fly.stateTimer <= 0) {
+          fly.state = Math.random() < 0.65 ? 'walking' : 'stopped';
+          fly.stateTimer = 24 + Math.floor(Math.random() * 54);
+          fly.targetSpeed = 1.05 + Math.random() * 1.3;
+        }
+      } else if (fly.state === 'leaving') {
+        fly.z += (1.05 - fly.z) * 0.14;
+        fly.wingPhase += 2.5;
+        fly.angle += normalizeAngle(fly.targetAngle - fly.angle) * 0.18;
+        fly.speed += (8.8 - fly.speed) * 0.16;
+
+        fly.x += Math.cos(fly.angle) * fly.speed;
+        fly.y += Math.sin(fly.angle) * fly.speed;
+        updateLegsIK(fly, false, false);
+
+        if (fly.x < -60 || fly.x > width + 60 || fly.y < -60 || fly.y > height + 60) {
+          fly.state = 'waiting';
+          scheduleNextWave(now);
+        }
+      }
+    }
+
+    function advanceSimulation(now, elapsedMs) {
+      LightSource.update(now);
+
+      for (const fly of flies) {
+        fly.frameStartX = fly.x;
+        fly.frameStartY = fly.y;
+        fly.frameStartAngle = fly.angle;
+      }
+
+      const fixedStepMs = 1000 / 60;
+      const steps = Math.max(1, Math.min(12, Math.round(elapsedMs / fixedStepMs)));
+      const subDt = elapsedMs / steps;
+
+      for (let s = 0; s < steps; s++) {
+        for (let i = 0; i < MAX_FLIES; i++) {
+          updateSingleFlyStep(flies[i], now, subDt);
+        }
+      }
+
+      for (const fly of flies) {
+        if (fly.state === 'waiting') {
+          fly.vx = 0;
+          fly.vy = 0;
+          fly.angularVel = 0;
+        } else {
+          fly.vx = fly.x - fly.frameStartX;
+          fly.vy = fly.y - fly.frameStartY;
+          fly.angularVel = normalizeAngle(fly.angle - fly.frameStartAngle);
+        }
+      }
+
+      SoundEngine.updateAll(flies, width, height, now);
+    }
+
+    // =========================================================================
+    // 4. 2関節インバースキネマティクス（2-Joint IK）
+    // =========================================================================
+    function solveTwoJointIK(hipX, hipY, footX, footY, L1, L2, bendDir) {
+      const dx = footX - hipX;
+      const dy = footY - hipY;
+      const maxReach = (L1 + L2) * 0.88;
+      const minReach = Math.abs(L1 - L2) + 0.8;
+      const dist = Math.max(minReach, Math.min(maxReach, Math.hypot(dx, dy)));
+
+      const baseAngle = Math.atan2(dy, dx);
+      const cosA = (L1 * L1 + dist * dist - L2 * L2) / (2 * L1 * dist);
+      const clampedCos = Math.max(-0.92, Math.min(0.92, cosA));
+      const angleOffset = Math.acos(clampedCos) * bendDir;
+
+      const kneeAngle = baseAngle + angleOffset;
+      const kneeX = hipX + Math.cos(kneeAngle) * L1;
+      const kneeY = hipY + Math.sin(kneeAngle) * L1;
+
+      const midX = kneeX + (footX - kneeX) * 0.72;
+      const midY = kneeY + (footY - kneeY) * 0.72;
+      const ankleAngle = Math.atan2(footY - kneeY, footX - kneeX) + bendDir * 0.14;
+      const tibLen = Math.hypot(footX - kneeX, footY - kneeY) * 0.72;
+      const ankleX = kneeX + Math.cos(ankleAngle) * tibLen;
+      const ankleY = kneeY + Math.sin(ankleAngle) * tibLen;
+
+      return { kneeX, kneeY, ankleX: (midX + ankleX) * 0.5, ankleY: (midY + ankleY) * 0.5 };
+    }
+
+    // =========================================================================
+    // 5. ふっくら丸い極細剛毛データ
+    // =========================================================================
+    const FINE_HAIRS = (() => {
+      const hairs = [];
+      for (let i = 0; i < 42; i++) {
+        const a = (i / 42) * Math.PI * 2;
+        const rx = Math.cos(a) * 5.6;
+        const ry = -1.2 + Math.sin(a) * 4.8;
+        const jitter = Math.sin(i * 19.3) * 0.34;
+        const outAngle = Math.atan2(Math.sin(a), Math.cos(a)) + jitter;
+        const len = 1.1 + (i % 4) * 0.38;
+        hairs.push({
+          x1: rx * 0.88,
+          y1: ry * 0.88,
+          x2: rx + Math.cos(outAngle) * len,
+          y2: ry + Math.sin(outAngle) * len + 0.15,
+          w: 0.14,
+          alpha: 0.80
+        });
+      }
+      for (let i = 0; i < 72; i++) {
+        const t = -0.32 + (i / 71) * (Math.PI + 0.64);
+        const rx = Math.cos(t) * 6.3;
+        const ry = 5.4 + Math.sin(t) * 6.0;
+        const jitter = Math.cos(i * 23.7) * 0.26;
+        const outAngle = t + jitter;
+        const len = 0.9 + (i % 5) * 0.28;
+        hairs.push({
+          x1: rx * 0.90,
+          y1: ry * 0.90,
+          x2: rx + Math.cos(outAngle) * len,
+          y2: ry + Math.sin(outAngle) * len,
+          w: 0.12,
+          alpha: 0.70
+        });
+      }
+      const headHairs = [
+        [-1.3, -8.6, -1.9, -10.2], [1.3, -8.6, 1.9, -10.2],
+        [-3.6, -7.8, -4.8, -9.0],  [3.6, -7.8, 4.8, -9.0],
+        [-4.9, -6.4, -6.1, -6.9],  [4.9, -6.4, 6.1, -6.9]
+      ];
+      for (const h of headHairs) {
+        hairs.push({ x1: h[0], y1: h[1], x2: h[2], y2: h[3], w: 0.14, alpha: 0.78 });
+      }
+      return hairs;
+    })();
+
+    // =========================================================================
+    // 6. 静止時にもう少し閉じた逆光透過スモーク翅＆濃墨翅脈
+    // =========================================================================
+    function drawReferenceFlyWing(s, isAirborne, wingPhase, spreadBias, isBlurGhost, wingLenScale, wingWidthScale) {
+      ctx.save();
+      ctx.translate(s * 2.4, -1.2);
+      ctx.scale(wingWidthScale * 1.08, wingLenScale * 0.94);
+
+      if (isAirborne) {
+        const sweepSamples = isBlurGhost ? 3 : 6;
+        for (let k = 0; k < sweepSamples; k++) {
+          const phaseOffset = (k / sweepSamples) * Math.PI;
+          const flapAng = s * (0.94 + Math.sin(wingPhase + phaseOffset) * 0.65);
+          ctx.save();
+          ctx.rotate(flapAng);
+          ctx.fillStyle = `rgba(48, 52, 58, ${isBlurGhost ? 0.07 : 0.12})`;
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.bezierCurveTo(s * 6.2, 1.6, s * 8.4, 9.8, s * 5.8, 18.4);
+          ctx.bezierCurveTo(s * 3.6, 22.0, s * 0.2, 21.4, -s * 1.0, 17.2);
+          ctx.closePath();
+          ctx.fill();
+
+          ctx.strokeStyle = `rgba(10, 12, 16, ${isBlurGhost ? 0.11 : 0.20})`;
+          ctx.lineWidth = 0.45;
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.bezierCurveTo(s * 6.2, 1.6, s * 8.4, 9.8, s * 5.8, 18.4);
+          ctx.stroke();
+          ctx.restore();
+        }
+        ctx.restore();
+        return;
+      }
+
+      // 静止時の翅を以前(0.72)より少し閉じて胴体寄りに納める（0.56 rad）
+      ctx.rotate(s * 0.56 + spreadBias);
+      ctx.scale(1.22, 1.14);
+
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.bezierCurveTo(s * 3.2, 1.0, s * 5.6, 5.6, s * 5.3, 12.2);
+      ctx.bezierCurveTo(s * 5.0, 16.5, s * 3.4, 19.2, s * 1.4, 19.2);
+      ctx.bezierCurveTo(-s * 0.3, 19.2, -s * 1.4, 16.0, -s * 1.6, 11.4);
+      ctx.bezierCurveTo(-s * 1.8, 6.8, -s * 1.0, 2.4, 0, 0);
+      ctx.closePath();
+
+      const wingGrad = ctx.createLinearGradient(s * 5.2, 4.0, -s * 1.4, 17.0);
+      wingGrad.addColorStop(0.0, 'rgba(54, 58, 64, 0.28)');
+      wingGrad.addColorStop(0.45, 'rgba(116, 120, 126, 0.19)');
+      wingGrad.addColorStop(1.0, 'rgba(66, 70, 76, 0.30)');
+      ctx.fillStyle = wingGrad;
+      ctx.fill();
+
+      ctx.strokeStyle = 'rgba(18, 20, 24, 0.62)';
+      ctx.lineWidth = 0.40;
+      ctx.stroke();
+
+      // 前縁脈（Costa）
+      ctx.strokeStyle = 'rgba(6, 7, 9, 0.95)';
+      ctx.lineWidth = 0.86;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.bezierCurveTo(s * 3.2, 1.0, s * 5.6, 5.6, s * 5.3, 12.2);
+      ctx.bezierCurveTo(s * 5.0, 15.8, s * 3.8, 18.2, s * 2.1, 19.0);
+      ctx.stroke();
+
+      // 縦脈群
+      ctx.strokeStyle = 'rgba(10, 11, 14, 0.90)';
+      ctx.lineWidth = 0.54;
+      ctx.beginPath();
+      ctx.moveTo(s * 0.15, 0.4);
+      ctx.quadraticCurveTo(s * 3.2, 2.6, s * 4.7, 7.6);
+      ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(12, 13, 16, 0.86)';
+      ctx.lineWidth = 0.48;
+      ctx.beginPath();
+      ctx.moveTo(s * 0.4, 1.2);
+      ctx.bezierCurveTo(s * 2.6, 3.8, s * 3.9, 9.0, s * 4.1, 15.6);
+      ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(10, 11, 14, 0.88)';
+      ctx.lineWidth = 0.50;
+      ctx.beginPath();
+      ctx.moveTo(s * 0.3, 1.4);
+      ctx.bezierCurveTo(s * 1.9, 5.4, s * 2.7, 11.4, s * 2.4, 18.8);
+      ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(12, 13, 16, 0.84)';
+      ctx.lineWidth = 0.45;
+      ctx.beginPath();
+      ctx.moveTo(s * 0.05, 2.1);
+      ctx.lineTo(s * 1.0, 8.4);
+      ctx.lineTo(s * 1.2, 13.4);
+      ctx.quadraticCurveTo(s * 1.7, 16.4, s * 2.1, 18.6);
+      ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(16, 18, 22, 0.78)';
+      ctx.lineWidth = 0.40;
+      ctx.beginPath();
+      ctx.moveTo(-s * 0.2, 2.9);
+      ctx.lineTo(s * 0.15, 9.5);
+      ctx.lineTo(-s * 0.35, 15.8);
+      ctx.moveTo(-s * 0.45, 4.7);
+      ctx.lineTo(-s * 0.95, 11.0);
+      ctx.stroke();
+
+      // 横脈（Cross-veins）
+      ctx.strokeStyle = 'rgba(12, 13, 16, 0.86)';
+      ctx.lineWidth = 0.44;
+      ctx.beginPath();
+      ctx.moveTo(s * 2.0, 8.0);
+      ctx.lineTo(s * 1.0, 8.4);
+      ctx.moveTo(s * 1.2, 13.4);
+      ctx.lineTo(-s * 0.05, 12.4);
+      ctx.stroke();
+
+      if (!isBlurGhost) {
+        ctx.strokeStyle = 'rgba(10, 11, 14, 0.80)';
+        ctx.lineWidth = 0.36;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.4, 2.1);
+        ctx.quadraticCurveTo(s * 1.1, 3.5, s * 2.2, 2.5);
+        ctx.moveTo(-s * 0.55, 4.3);
+        ctx.quadraticCurveTo(s * 0.6, 5.1, s * 1.3, 4.1);
+        ctx.stroke();
+      }
+
+      ctx.restore();
+    }
+
+    // =========================================================================
+    // 7. 3D奥行き＋短め・前寄り配置の左右対称8本脚・丸っこいシルエット描画
+    // =========================================================================
+    function renderFlyPass(fly, posX, posY, angle, zDepth, opacity, isBlurGhost) {
+      const perspScale = getDepthPerspectiveScale(zDepth);
+      const unitScale = fly.scale * perspScale;
+      const bodyRot = angle + Math.PI / 2;
+      const isAirborne = fly.state === 'flying' || fly.state === 'landing_approach' || fly.state === 'leaving';
+      const heightOffScreen = Math.max(0, zDepth);
+
+      const distToLight = Math.hypot(posX - LightSource.x, posY - LightSource.y);
+      const lightProximity = Math.max(0, 1.0 - distToLight / (Math.min(width, height) * 0.65));
+
+      const dofBlur = heightOffScreen * 4.4;
+      const backlightBlurPx = isBlurGhost
+        ? (0.95 + dofBlur * 1.15)
+        : (0.35 + dofBlur + lightProximity * 0.22);
+
+      const depthAlphaFactor = 1.0 - heightOffScreen * 0.14;
+
+      ctx.save();
+      ctx.globalAlpha = opacity * depthAlphaFactor;
+
+      if (!isBlurGhost) {
+        // 1) 強い逆光による輪郭周囲のホワイト・ハレーション
+        ctx.save();
+        ctx.translate(posX, posY);
+        ctx.rotate(bodyRot);
+        ctx.scale(unitScale, unitScale);
+        ctx.filter = `blur(${6.5 + heightOffScreen * 6.5 + lightProximity * 3.5}px)`;
+        ctx.fillStyle = `rgba(255, 255, 255, ${0.84 + lightProximity * 0.16})`;
+        ctx.beginPath();
+        ctx.ellipse(0, 1.2, 11.5, 16.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+
+        // 2) 奥行きZに応じた投影影
+        const awayX = posX - LightSource.x;
+        const awayY = posY - LightSource.y;
+        const awayDist = Math.max(1, Math.hypot(awayX, awayY));
+        const shadowDirX = (awayX / awayDist) * 0.48;
+        const shadowDirY = (awayY / awayDist) * 0.48 + 0.65;
+        const shadowLen = 1.4 + heightOffScreen * 24.0;
+        const shadowScale = fly.scale * (1.0 + heightOffScreen * 0.12);
+
+        ctx.save();
+        ctx.translate(posX + shadowDirX * shadowLen, posY + shadowDirY * shadowLen);
+        ctx.rotate(bodyRot);
+        ctx.scale(shadowScale, shadowScale);
+        ctx.filter = `blur(${7.5 + heightOffScreen * 16.0}px)`;
+        ctx.fillStyle = `rgba(22, 24, 28, ${Math.max(0.04, 0.28 - heightOffScreen * 0.17)})`;
+        ctx.beginPath();
+        ctx.ellipse(0, 1.2, 8.4, 13.0, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+
+        if (heightOffScreen < 0.75) {
+          ctx.save();
+          ctx.translate(posX + shadowDirX * (0.6 + heightOffScreen * 7.5), posY + shadowDirY * (0.8 + heightOffScreen * 8.5));
+          ctx.rotate(bodyRot);
+          ctx.scale(shadowScale, shadowScale);
+          ctx.filter = `blur(${3.2 + heightOffScreen * 8.5}px)`;
+          ctx.fillStyle = `rgba(12, 14, 18, ${Math.max(0.03, 0.30 - heightOffScreen * 0.24)})`;
+          ctx.beginPath();
+          ctx.ellipse(0, 1.0, 6.0, 9.8, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
+      // 3) 逆光シルエット本体・短め前寄り配置の左右対称8本脚・丸っこい胴体・翅
+      ctx.save();
+      ctx.filter = `blur(${backlightBlurPx}px)`;
+
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      for (const leg of fly.legs) {
+        const s = leg.spec.side;
+        const hipWorld = localToWorld(leg.spec.hipLocal.x, leg.spec.hipLocal.y, posX, posY, angle, unitScale);
+
+        let footX = leg.worldFootX + (posX - fly.x);
+        let footY = leg.worldFootY + (posY - fly.y);
+        let isLifted = leg.isStepping;
+
+        if (!isBlurGhost && fly.state === 'grooming') {
+          const rub = Math.sin(fly.groomPhase);
+          const rub2 = Math.cos(fly.groomPhase * 1.7);
+          if (fly.groomType === 'front' && leg.spec.idx === 0) {
+            const target = localToWorld(
+              s * (1.0 + rub2 * 0.45),
+              -12.6 + s * rub * 2.0,
+              posX, posY, angle, unitScale
+            );
+            footX = target.x;
+            footY = target.y;
+            isLifted = true;
+          } else if (fly.groomType === 'hind' && leg.spec.idx === 2) {
+            const target = localToWorld(
+              s * (1.1 + rub2 * 0.45),
+              11.2 + s * rub * 2.0,
+              posX, posY, angle, unitScale
+            );
+            footX = target.x;
+            footY = target.y;
+            isLifted = true;
+          }
+        }
+
+        if (!isBlurGhost && (isLifted || fly.state === 'grooming')) {
+          const fvx = footX - leg.prevFootX;
+          const fvy = footY - leg.prevFootY;
+          const fSpeed = Math.hypot(fvx, fvy);
+          if (fSpeed > 0.35) {
+            ctx.strokeStyle = 'rgba(14, 16, 20, 0.24)';
+            ctx.lineWidth = 0.78 * unitScale;
+            ctx.beginPath();
+            ctx.moveTo(leg.prevFootX, leg.prevFootY);
+            ctx.lineTo(footX, footY);
+            ctx.stroke();
+          }
+        }
+
+        const bendDir = leg.spec.idx === 0 ? -s : s;
+        const ik = solveTwoJointIK(
+          hipWorld.x, hipWorld.y,
+          footX, footY,
+          leg.spec.femurLen * unitScale,
+          leg.spec.tibiaLen * unitScale,
+          bendDir
+        );
+
+        if (!isBlurGhost && !isAirborne && !isLifted) {
+          ctx.save();
+          ctx.fillStyle = 'rgba(16, 18, 22, 0.24)';
+          ctx.beginPath();
+          ctx.arc(footX + 0.35, footY + 0.55, 1.0 * unitScale, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // 腿節（Femur）
+        ctx.strokeStyle = 'rgba(2, 3, 4, 0.98)';
+        ctx.lineWidth = 1.15 * unitScale;
+        ctx.beginPath();
+        ctx.moveTo(hipWorld.x, hipWorld.y);
+        ctx.lineTo(ik.kneeX, ik.kneeY);
+        ctx.stroke();
+
+        // 脛節（Tibia）
+        ctx.strokeStyle = 'rgba(5, 6, 8, 0.95)';
+        ctx.lineWidth = 0.80 * unitScale;
+        ctx.beginPath();
+        ctx.moveTo(ik.kneeX, ik.kneeY);
+        ctx.lineTo(ik.ankleX, ik.ankleY);
+        ctx.stroke();
+
+        // 跗節（Tarsus）
+        ctx.strokeStyle = 'rgba(12, 13, 16, 0.92)';
+        ctx.lineWidth = 0.52 * unitScale;
+        ctx.beginPath();
+        ctx.moveTo(ik.ankleX, ik.ankleY);
+        ctx.lineTo(footX, footY);
+        ctx.stroke();
+
+        if (!isBlurGhost) {
+          ctx.strokeStyle = 'rgba(10, 12, 16, 0.48)';
+          ctx.lineWidth = 0.13 * unitScale;
+          for (let sp = 0.25; sp <= 0.85; sp += 0.3) {
+            const sx = ik.kneeX + (ik.ankleX - ik.kneeX) * sp;
+            const sy = ik.kneeY + (ik.ankleY - ik.kneeY) * sp;
+            const ang = Math.atan2(ik.ankleY - ik.kneeY, ik.ankleX - ik.kneeX) + s * 0.9;
+            ctx.beginPath();
+            ctx.moveTo(sx, sy);
+            ctx.lineTo(sx + Math.cos(ang) * 0.65 * unitScale, sy + Math.sin(ang) * 0.65 * unitScale);
+            ctx.stroke();
+          }
+        }
+      }
+      ctx.restore();
+
+      // 胴体（ふっくら丸っこいシルエット）
+      ctx.save();
+      ctx.translate(posX, posY);
+      ctx.scale(unitScale, unitScale);
+      ctx.rotate(bodyRot);
+
+      // 1) 腹部（Abdomen）
+      ctx.save();
+      const abdGrad = ctx.createRadialGradient(0, 5.2, 1.8, 0, 5.6, 7.4);
+      abdGrad.addColorStop(0.0, '#010102');
+      abdGrad.addColorStop(0.78, '#040506');
+      abdGrad.addColorStop(0.95, 'rgba(12, 14, 18, 0.94)');
+      abdGrad.addColorStop(1.0, 'rgba(32, 35, 40, 0.50)');
+      ctx.fillStyle = abdGrad;
+      ctx.beginPath();
+      ctx.moveTo(0, -0.4);
+      ctx.bezierCurveTo(6.5, -0.2, 6.8, 5.8, 4.4, 9.8);
+      ctx.bezierCurveTo(2.7, 11.8, 1.1, 12.2, 0, 12.2);
+      ctx.bezierCurveTo(-1.1, 12.2, -2.7, 11.8, -4.4, 9.8);
+      ctx.bezierCurveTo(-6.8, 5.8, -6.5, -0.2, 0, -0.4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+
+      // 2) 胸部（Thorax）
+      const thoraxGrad = ctx.createRadialGradient(0, -1.4, 1.5, 0, -1.4, 6.0);
+      thoraxGrad.addColorStop(0.0, '#010102');
+      thoraxGrad.addColorStop(0.84, '#040506');
+      thoraxGrad.addColorStop(1.0, 'rgba(20, 22, 26, 0.82)');
+      ctx.fillStyle = thoraxGrad;
+      ctx.beginPath();
+      ctx.ellipse(0, -1.4, 5.8, 5.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 3) 極細の剛毛・短毛
+      if (!isBlurGhost) {
+        ctx.lineCap = 'round';
+        for (const h of FINE_HAIRS) {
+          ctx.strokeStyle = `rgba(8, 9, 12, ${h.alpha})`;
+          ctx.lineWidth = h.w;
+          ctx.beginPath();
+          ctx.moveTo(h.x1, h.y1);
+          ctx.lineTo(h.x2, h.y2);
+          ctx.stroke();
+        }
+      }
+
+      // 4) 頭部（Head）＆ 大きく横に張り出した複眼（Compound Eyes）
+      ctx.fillStyle = '#010102';
+      ctx.beginPath();
+      ctx.ellipse(0, -6.7, 5.2, 2.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      for (const s of [-1, 1]) {
+        ctx.save();
+        ctx.translate(s * 3.2, -6.7);
+        ctx.rotate(s * 0.12);
+        const eyeGrad = ctx.createRadialGradient(0, 0, 0.6, 0, 0, 3.2);
+        eyeGrad.addColorStop(0.0, '#010102');
+        eyeGrad.addColorStop(0.85, '#050608');
+        eyeGrad.addColorStop(1.0, 'rgba(20, 22, 26, 0.80)');
+        ctx.fillStyle = eyeGrad;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 3.1, 2.55, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // 5) 触角・口器
+      ctx.strokeStyle = '#030405';
+      ctx.lineWidth = 0.56;
+      ctx.lineCap = 'round';
+      for (const s of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(s * 0.65, -8.5);
+        ctx.quadraticCurveTo(s * 1.35, -9.8, s * 2.15, -10.6);
+        ctx.stroke();
+      }
+
+      // 6) 個体ごとに長さ・幅を変えた左右の翅（静止時に少し閉じた角度）
+      for (const s of [-1, 1]) {
+        drawReferenceFlyWing(
+          s,
+          isAirborne,
+          fly.wingPhase,
+          s * fly.wingSpreadBias,
+          isBlurGhost,
+          fly.wingLenScale,
+          fly.wingWidthScale
+        );
+      }
+
+      ctx.restore();
+      ctx.restore();
+      ctx.restore();
+    }
+
+    // =========================================================================
+    // 8. 奥行きのある逆光＆光漏れ背景＋手前ブルーム演出
+    // =========================================================================
+    function drawBacklightBaseWithLightLeak(now) {
+      const maxR = Math.hypot(width, height);
+      const breathe = 0.5 + 0.5 * Math.sin(now * 0.0007);
+
+      const bgGrad = ctx.createRadialGradient(
+        LightSource.x, LightSource.y, maxR * 0.03,
+        width * 0.5, height * 0.5, maxR * 0.86
+      );
+      bgGrad.addColorStop(0.0, '#ffffff');
+      bgGrad.addColorStop(0.30, '#f8f9fb');
+      bgGrad.addColorStop(0.66, '#e6e9ef');
+      bgGrad.addColorStop(1.0, '#cfd4de');
+      ctx.fillStyle = bgGrad;
+      ctx.fillRect(0, 0, width, height);
+
+      const leakRadius = Math.min(width, height) * (0.42 + breathe * 0.04);
+      const coreLeak = ctx.createRadialGradient(
+        LightSource.x, LightSource.y, 0,
+        LightSource.x, LightSource.y, leakRadius
+      );
+      coreLeak.addColorStop(0.0, 'rgba(255, 255, 255, 0.98)');
+      coreLeak.addColorStop(0.45, 'rgba(255, 255, 255, 0.72)');
+      coreLeak.addColorStop(0.80, 'rgba(255, 255, 255, 0.22)');
+      coreLeak.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
+      ctx.fillStyle = coreLeak;
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.save();
+      const edgeLeakX = width * 0.86 + Math.cos(now * 0.0004) * 18;
+      const edgeLeakY = height * 0.14 + Math.sin(now * 0.0005) * 14;
+      const edgeGrad = ctx.createRadialGradient(
+        edgeLeakX, edgeLeakY, 0,
+        edgeLeakX, edgeLeakY, Math.min(width, height) * 0.48
+      );
+      edgeGrad.addColorStop(0.0, 'rgba(255, 255, 255, 0.88)');
+      edgeGrad.addColorStop(0.55, 'rgba(255, 255, 255, 0.30)');
+      edgeGrad.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
+      ctx.fillStyle = edgeGrad;
+      ctx.fillRect(0, 0, width, height);
+      ctx.restore();
+    }
+
+    function drawForegroundLightSpill(now) {
+      const pulse = 0.5 + 0.5 * Math.sin(now * 0.0009 + 1.2);
+      ctx.save();
+      ctx.globalCompositeOperation = 'screen';
+
+      const spillR = Math.min(width, height) * (0.36 + pulse * 0.03);
+      const spillGrad = ctx.createRadialGradient(
+        LightSource.x, LightSource.y, 0,
+        LightSource.x, LightSource.y, spillR
+      );
+      spillGrad.addColorStop(0.0, 'rgba(255, 255, 255, 0.26)');
+      spillGrad.addColorStop(0.5, 'rgba(255, 255, 255, 0.11)');
+      spillGrad.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
+      ctx.fillStyle = spillGrad;
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.restore();
+    }
+
+    function drawSingleFlyWithMotionBlur(fly) {
+      if (fly.state === 'waiting') return;
+
+      const moveDist = Math.hypot(fly.vx, fly.vy);
+      const rotDist = Math.abs(fly.angularVel) * 7.5;
+      const blurIntensity = Math.min(1.0, (moveDist + rotDist) / 14.0);
+
+      if (blurIntensity > 0.08) {
+        const samples = Math.min(6, Math.max(3, Math.ceil(blurIntensity * 6)));
+        for (let i = samples; i >= 1; i--) {
+          const t = (i / (samples + 1)) * 0.58;
+          const ghostX = fly.x - fly.vx * t;
+          const ghostY = fly.y - fly.vy * t;
+          const ghostAngle = fly.angle - fly.angularVel * t;
+          const ghostAlpha = (1.0 - t) * 0.26 * blurIntensity;
+          renderFlyPass(fly, ghostX, ghostY, ghostAngle, fly.z, ghostAlpha, true);
+        }
+      }
+
+      const mainAlpha = blurIntensity > 0.35 ? (1.0 - blurIntensity * 0.16) : 1.0;
+      renderFlyPass(fly, fly.x, fly.y, fly.angle, fly.z, mainAlpha, false);
+    }
+
+    // =========================================================================
+    // 9. あえてラグいモニタープレビュー風の不規則コマ落ち・スタター描画ループ
+    // =========================================================================
+    let lastTickTime = performance.now();
+    let nextPreviewDelayMs = 68;
+
+    function pickNextLaggyFrameInterval() {
+      const r = Math.random();
+      if (r < 0.16) {
+        return 140 + Math.random() * 100;
+      } else if (r < 0.42) {
+        return 85 + Math.random() * 50;
+      } else {
+        return 52 + Math.random() * 30;
+      }
+    }
+
+    function loop(now) {
+      requestAnimationFrame(loop);
+
+      const elapsed = now - lastTickTime;
+      if (elapsed < nextPreviewDelayMs) {
+        return;
+      }
+
+      const simDeltaMs = Math.min(elapsed, 260);
+      lastTickTime = now;
+      nextPreviewDelayMs = pickNextLaggyFrameInterval();
+
+      advanceSimulation(now, simDeltaMs);
+      drawBacklightBaseWithLightLeak(now);
+
+      const sortedFlies = [...flies].sort((a, b) => a.z - b.z);
+      for (const fly of sortedFlies) {
+        drawSingleFlyWithMotionBlur(fly);
+      }
+
+      drawForegroundLightSpill(now);
+    }
+
+    drawBacklightBaseWithLightLeak(performance.now());
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
